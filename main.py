@@ -52,6 +52,9 @@ def parse_args():
     args = parser.parse_args()
     args.save_dir = os.path.join(args.output, f'{args.name}')
 
+    if args.gpu is not None and torch.cuda.is_available():
+        torch.cuda.set_device(args.gpu)
+
     return args
 
 def replace_value_in_dict(d, old_value, new_value):
@@ -89,8 +92,10 @@ def main():
     logger.save_config(config)
 
 
-    model = instantiate_from_config(config['model']).cuda()
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = instantiate_from_config(config['model']).to(device)
 
+    
     if args.sample == 1 and args.mode in ['infill', 'predict']:
         test_dataloader_info = build_dataloader_cond(config, args)
     # import ipdb; ipdb.set_trace()

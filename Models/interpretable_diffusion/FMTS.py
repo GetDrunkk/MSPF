@@ -8,7 +8,6 @@ from Models.interpretable_diffusion.transformer import Transformer
 import os
 
 
-
 class FM_TS(nn.Module):
     def __init__(
             self,
@@ -29,6 +28,7 @@ class FM_TS(nn.Module):
 
         self.seq_length = seq_length
         self.feature_size = feature_size
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         self.model = Transformer(n_feat=feature_size, n_channel=seq_length, n_layer_enc=n_layer_enc, n_layer_dec=n_layer_dec,
                                  n_heads=n_heads, attn_pdrop=attn_pd, resid_pdrop=resid_pd, mlp_hidden_times=mlp_hidden_times,
@@ -54,7 +54,7 @@ class FM_TS(nn.Module):
         
         self.eval()
 
-        zt = torch.randn(shape).cuda()  ## init the noise 
+        zt = torch.randn(shape).to(self.device)  ## init the noise 
 
         ## t shifting from stable diffusion 3
         timesteps = torch.linspace(0, 1, self.num_timesteps+1)
@@ -63,7 +63,7 @@ class FM_TS(nn.Module):
 
         for t_curr, t_prev in zip(t_shifted[:-1], t_shifted[1:]):
             step = t_prev - t_curr
-            v = self.output(zt.clone(), torch.tensor([t_curr*self.time_scalar]).unsqueeze(0).repeat(zt.shape[0], 1).cuda().squeeze(), padding_masks=None)                  
+            v = self.output(zt.clone(), torch.tensor([t_curr*self.time_scalar]).unsqueeze(0).repeat(zt.shape[0], 1).to(self.device).squeeze(), padding_masks=None)                  
             zt = zt.clone() + step * v 
 
         return zt 
@@ -115,20 +115,20 @@ class FM_TS(nn.Module):
 
     def fast_sample_infill(self, shape, target, partial_mask=None):
 
-        z0 = torch.randn(shape).cuda()
+        z0 = torch.randn(shape).to(self.device)
         z1 = zt = z0
         for t in range(self.num_timesteps):
             t = t/self.num_timesteps  ## scale to 0-1
             t = t**(float(os.environ['hucfg_Kscale']))  ## perform t-power sampling
 
             
-            z0 = torch.randn(shape).cuda()  ## re init the z0
+            z0 = torch.randn(shape).to(self.device)  ## re init the z0
 
             target_t = target*t + z0*(1-t)  ## get the noisy target
             zt = z1*t + z0*(1-t)  ##
             # import ipdb; ipdb.set_trace()
             zt[partial_mask] = target_t[partial_mask]  ## replace with the noisy version of given ground truth information
-            v = self.output(zt, torch.tensor([t*self.time_scalar]).cuda(), None) 
+            v = self.output(zt, torch.tensor([t*self.time_scalar]).to(self.device), None) 
 
             z1 = zt.clone() + (1 - t) * v  ## one step euler
             z1 = torch.clamp(z1, min=-1, max=1) ## make sure the upper and lower bound dont exceed

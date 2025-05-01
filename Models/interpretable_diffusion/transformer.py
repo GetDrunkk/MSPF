@@ -9,7 +9,6 @@ from Models.interpretable_diffusion.model_utils import LearnablePositionalEncodi
                                                        AdaLayerNorm, Transpose, RMSNorm, GELU2, series_decomp
 import os
 
-## hunote: our backbone network is most same as diffusion-TS. Diffusion-TS backbone has really good potential!!
 class TrendBlock(nn.Module):
     """
     Model trend of time series using the polynomial regressor.
@@ -112,6 +111,8 @@ class SeasonBlock(nn.Module):
         s1 = torch.stack([torch.cos(2 * np.pi * p * fourier_space) for p in range(1, p1 + 1)], dim=0)
         s2 = torch.stack([torch.sin(2 * np.pi * p * fourier_space) for p in range(1, p2 + 1)], dim=0)
         self.poly_space = torch.cat([s1, s2])
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 
     def forward(self, input):
         b, c, h = input.shape
@@ -200,7 +201,7 @@ class FullAttention(nn.Module):
 
 
         if int(os.environ.get('hucfg_attention_rope_use', '-1')) == 1: 
-            freqs_cis = self.freqs_cis.cuda()[0 : T]
+            freqs_cis = self.freqs_cis.to(self.device)[0 : T]
             q, k = apply_rotary_emb(q.permute(0,2,1,3), k.permute(0,2,1,3), freqs_cis=freqs_cis)
             q, k = q.permute(0,2,1,3), k.permute(0,2,1,3)
 
@@ -259,6 +260,9 @@ class CrossAttention(nn.Module):
         self.register = nn.Parameter(torch.randn([1, self.regi_num, n_embd]))
         self.register_2 = nn.Parameter(torch.randn([1, self.regi_num, n_embd]))
 
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
 
     def forward(self, x, encoder_output, mask=None):
         
@@ -281,7 +285,7 @@ class CrossAttention(nn.Module):
         k = k.view(B, T_E, self.n_head, C // self.n_head).transpose(1, 2)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
-        freqs_cis = self.freqs_cis.cuda()[0 : T]
+        freqs_cis = self.freqs_cis.to(self.device)[0 : T]
         q, k = apply_rotary_emb(q.permute(0,2,1,3), k.permute(0,2,1,3), freqs_cis=freqs_cis)
         q, k = q.permute(0,2,1,3), k.permute(0,2,1,3)
 
