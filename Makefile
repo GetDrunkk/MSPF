@@ -2,8 +2,30 @@
 ENV_DIR := .venv
 PYTHON_VERSION := 3.8.10
 
-.PHONY: setup clean activate run train evaluate
+# ---------- 通用设置 ----------
+ENV_DIR        := .venv
+PYTHON         := $(ENV_DIR)/bin/python
+PYTHON_VERSION := 3.8.10
 
+# ---------- 配置文件 ----------
+CFG_B0 := Config/etth_B0.yaml
+CFG_C1 := Config/etth_C1.yaml
+
+# ---------- 实验别名 ----------
+NAME_B0 := etth_b0_gap1k
+NAME_C1 := etth_c1_gap1k
+
+# results_folder 会自动拼接 _8000
+CKPT_DIR_B0 := ./Checkpoints_$(NAME_B0)_8000
+CKPT_DIR_C1 := ./Checkpoints_$(NAME_C1)_8000
+
+# 保存周期 1800 ⇒ 第一次 checkpoint-1.pt，第二次 checkpoint-2.pt…
+CKPT_TAG := 10        # 评估第几号 checkpoint；按需改
+.PHONY: setup clean activate run train evaluate \
+        train-gap1k  infer-gap1k  full-gap1k
+
+
+# ---------- 原有目标保持不变 ----------
 setup:
 	rm -rf $(ENV_DIR)
 	@command -v pyenv >/dev/null 2>&1 || { echo '❌ pyenv not found. Please install pyenv.'; exit 1; }
@@ -16,10 +38,8 @@ setup:
 	@pyenv exec python -m venv $(ENV_DIR)
 
 	@$(ENV_DIR)/bin/pip install --upgrade pip setuptools wheel
-
 	@$(ENV_DIR)/bin/pip install -r requirements.txt || echo "⚠️ Please provide a requirements.txt file."
 	@echo "✅ Setup complete. Activate with: source $(ENV_DIR)/bin/activate"
-
 
 run:
 	bash scripts/run_interpolation.sh
@@ -45,3 +65,54 @@ debug:
 sample:
 	@echo "🚀 Running inference and plotting..."
 	@$(ENV_DIR)/bin/python sample_and_plot.py
+
+
+# ---------- ★ 新增目标：1 000 步连续缺口实验 ----------
+
+
+# ==================== 目标 ====================
+.PHONY: train-b0 train-c1 infer-b0 infer-c1 \
+        full-b0 full-c1 full-all
+
+# ------- Baseline-B0 -------
+train-b0:
+	@echo "🏋️  Train B0 ..."
+	@export results_folder=$(CKPT_DIR_B0) && \
+	PYTHONPATH=. $(PYTHON) main.py \
+	    --train \
+	    --config_file $(CFG_B0) \
+	    --name $(NAME_B0)
+
+infer-b0:
+	@echo "🔍  Inference B0 ..."
+	@export results_folder=$(CKPT_DIR_B0) && \
+	PYTHONPATH=. $(PYTHON) scripts/eval_infill.py \
+	    --config $(CFG_B0) \
+	    --ckpt $(CKPT_TAG) \
+	    --name  $(NAME_B0) \
+	    --plot_num 3
+
+full-b0: train-b0 infer-b0
+
+# ------- Baseline-C1 -------
+train-c1:
+	@echo "🏋️  Train C1 ..."
+	@export results_folder=$(CKPT_DIR_C1) && \
+	PYTHONPATH=. $(PYTHON) main.py \
+	    --train \
+	    --config_file $(CFG_C1) \
+	    --name $(NAME_C1)
+
+infer-c1:
+	@echo "🔍  Inference C1 ..."
+	@export results_folder=$(CKPT_DIR_C1) && \
+	PYTHONPATH=. $(PYTHON) scripts/eval_infill.py \
+	    --config $(CFG_C1) \
+	    --ckpt  $(CKPT_TAG) \
+	    --name  $(NAME_C1) \
+	    --plot_num 3
+
+full-c1: train-c1 infer-c1
+
+# ------- 同时跑两个 baseline（可 -j 并行） -------
+full-all: full-b0 full-c1

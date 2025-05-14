@@ -26,7 +26,11 @@ class CustomDataset(Dataset):
         missing_ratio=None,
         style='separate', 
         distribution='geometric', 
-        mean_mask_length=3
+        mean_mask_length=3,
+        long_gap=False,         # 是否启用连续缺口
+        gap_len=1000,           # 连续缺口长度
+        apply_prob=1.0,         # 生成缺口的样本比例
+        return_mask=False,      # 训练阶段是否把 mask 返回给模型
     ):
         super(CustomDataset, self).__init__()
         assert period in ['train', 'test'], 'period must be train or test.'
@@ -48,16 +52,20 @@ class CustomDataset(Dataset):
         train, inference = self.__getsamples(self.data, proportion, seed)
 
         self.samples = train if period == 'train' else inference
-        if period == 'test':
-            if missing_ratio is not None:
+        # ---------- 仅在需要 old masking 方案时进入 ----------
+        if period == 'test' and (missing_ratio is not None or predict_length is not None):
+            if missing_ratio is not None:          # 稀疏缺口方案
                 self.masking = self.mask_data(seed)
-            elif predict_length is not None:
+            elif predict_length is not None:       # 末尾置零预测方案
                 masks = np.ones(self.samples.shape)
                 masks[:, -predict_length:, :] = 0
                 self.masking = masks.astype(bool)
-            else:
-                raise NotImplementedError()
+        # ------------------------------------------------------
         self.sample_num = self.samples.shape[0]
+        self.long_gap   = long_gap
+        self.gap_len    = gap_len
+        self.apply_prob = apply_prob
+        self.return_mask= return_mask
 
     def __getsamples(self, data, proportion, seed):
         x = np.zeros((self.sample_num_total, self.window, self.var_num))
@@ -82,6 +90,13 @@ class CustomDataset(Dataset):
                 np.save(os.path.join(self.dir, f"{self.name}_norm_truth_{self.window}_train.npy"), train_data)
 
         return train_data, test_data
+
+    def _make_long_gap(self, length:int):
+        g = min(self.gap_len, length-2)
+        s = np.random.randint(0, length-g-1)
+        m = np.ones(length, bool)
+        m[s:s+g] = False
+        return m
 
     def normalize(self, sq):
         d = sq.reshape(-1, self.var_num)
@@ -159,10 +174,19 @@ class CustomDataset(Dataset):
 
     def __getitem__(self, ind):
         if self.period == 'test':
-            x = self.samples[ind, :, :]  # (seq_length, feat_dim) array
-            m = self.masking[ind, :, :]  # (seq_length, feat_dim) boolean array
+            x = self.samples[ind, :, :]
+            m = self.masking[ind, :, :]
             return torch.from_numpy(x).float(), torch.from_numpy(m)
-        x = self.samples[ind, :, :]  # (seq_length, feat_dim) array
+
+        x = self.samples[ind, :, :]                      # (T,D)
+        if self.long_gap and np.random.rand() < self.apply_prob:
+            mask1d = self._make_long_gap(self.window)
+        else:
+            mask1d = np.ones(self.window, bool)
+        mask = np.repeat(mask1d[:, None], self.var_num, axis=1)
+
+        if self.return_mask:
+            return torch.from_numpy(x).float(), torch.from_numpy(mask)
         return torch.from_numpy(x).float()
 
     def __len__(self):

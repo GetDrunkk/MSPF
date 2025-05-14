@@ -91,8 +91,20 @@ class Trainer(object):
             while step < self.train_num_steps:
                 total_loss = 0.
                 for _ in range(self.gradient_accumulate_every):
-                    data = next(self.dl).to(device)
-                    loss = self.model(data)
+                    batch = next(self.dl)
+                    if isinstance(batch, tuple):          # 插值路径
+                        seq, mask = batch                 # seq [B,T,D]
+                        seq  = seq.to(device)
+                        mask = mask.to(device)            # [B,T,D]
+                        seq_in = seq.clone()
+                        seq_in[~mask] = 0.0               # 缺口置 0
+                        loss = self.model(
+                            seq_in.permute(0, 2, 1),      # [B,D,T]
+                            mask.any(-1)                  # [B,T]
+                        )
+                    else:                                # 旧路径
+                        seq = batch.to(device)
+                        loss = self.model(seq.permute(0,2,1))
                     loss = loss / self.gradient_accumulate_every
                     loss.backward()
                     total_loss += loss.item()

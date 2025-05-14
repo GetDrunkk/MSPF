@@ -6,6 +6,7 @@ from einops import reduce
 from tqdm.auto import tqdm
 from Models.interpretable_diffusion.transformer import Transformer
 import os
+from typing import Optional
 
 
 class FM_TS(nn.Module):
@@ -40,33 +41,36 @@ class FM_TS(nn.Module):
 
         self.num_timesteps = int(os.environ.get('hucfg_num_steps', '100'))
     
-    def output(self, x, t, padding_masks=None):
-
-        output = self.model(x, t, padding_masks=None)
-
-        return output
+    def output(self, x, t, mask:Optional[torch.Tensor]=None, padding_masks=None):
+        """
+        x   : [B, D, T]     (缺口处已置 0)
+        mask: [B, T]  True=观测 False=缺口   (C1 训练/推理时提供，B0 为 None)
+        """
+        if mask is not None:
+            # 只有当 x 里还没包含 mask 通道时才拼接
+            if x.shape[1] == self.feature_size - 1:     # 自适应判断
+                x = torch.cat([x, mask.unsqueeze(1).float()], dim=1)
+        return self.model(x, t, padding_masks=None)
 
 
 
     @torch.no_grad()
     def sample(self, shape):
-        
-        
+        assert self.feature_size == 7, "Unconditional sampling (sample / generate_mts) 仅在 B0 使用"
         self.eval()
-
-        zt = torch.randn(shape).to(self.device)  ## init the noise 
-
-        ## t shifting from stable diffusion 3
-        timesteps = torch.linspace(0, 1, self.num_timesteps+1)
-        t_shifted = 1-(self.alpha * timesteps) / (1 + (self.alpha - 1) * timesteps)
+        zt = torch.randn(shape, device=self.device)
+        timesteps = torch.linspace(0, 1, self.num_timesteps+1, device=self.device)
+        t_shifted = 1 - (self.alpha * timesteps) / (1 + (self.alpha - 1) * timesteps)
         t_shifted = t_shifted.flip(0)
 
         for t_curr, t_prev in zip(t_shifted[:-1], t_shifted[1:]):
             step = t_prev - t_curr
-            v = self.output(zt.clone(), torch.tensor([t_curr*self.time_scalar]).unsqueeze(0).repeat(zt.shape[0], 1).to(self.device).squeeze(), padding_masks=None)                  
-            zt = zt.clone() + step * v 
-
-        return zt 
+            v = self.output(zt.clone(),
+                            torch.full((shape[0],), t_curr*self.time_scalar,
+                                    device=self.device),
+                            mask=None)
+            zt = zt + step * v
+        return zt
 
 
 
@@ -78,38 +82,34 @@ class FM_TS(nn.Module):
 
 
 
-    def _train_loss(self, x_start):
-        
-        z0 = torch.randn_like(x_start) 
+    def _train_loss(self, x_start, mask=None):
+        """
+        mask: Bool [B,T]  True=观测  False=缺口
+              若为 None (B0) 则在所有位置计算损失
+        """
+        z0 = torch.randn_like(x_start)
         z1 = x_start
+        t  = torch.rand(z0.shape[0],1,1, device=z0.device)
 
-        t = torch.rand(z0.shape[0], 1, 1).to(z0.device)
-        if str(os.environ.get('hucfg_t_sampling', 'uniform')) == 'logitnorm':
-            t = torch.sigmoid(torch.randn(z0.shape[0], 1, 1)).to(z0.device)
-       
-
-
-
-        z_t =  t * z1 + (1.-t) * z0
-
-        
-
+        z_t    = t * z1 + (1.-t) * z0
         target = z1 - z0
 
-        model_out = self.output(z_t, t.squeeze()*self.time_scalar, None)
-        train_loss = F.mse_loss(model_out, target, reduction='none')
+        model_out = self.output(z_t, t.squeeze()*self.time_scalar, mask)
+
+        mse = (model_out - target) ** 2          # [B,D,T]
+        if mask is not None:                     # 仅缺口位置
+            mse = mse.permute(0,2,1)[~mask]
+        else:                                    # B0：全部位置
+            mse = mse.view(-1)
+        return mse.mean()
 
 
-
-        
-        train_loss = reduce(train_loss, 'b ... -> b (...)', 'mean')
-        train_loss = train_loss.mean()
-        return train_loss.mean()
-
-    def forward(self, x):
-        b, c, n, device, feature_size, = *x.shape, x.device, self.feature_size
-        assert n == feature_size, f'number of variable must be {feature_size}'
-        return self._train_loss(x_start=x)
+    def forward(self, x, mask=None):
+        """
+        x    : [B, D, T]  (缺口已置 0)
+        mask : Bool [B,T]  or None
+        """
+        return self._train_loss(x_start=x, mask=mask)
 
 
 
@@ -127,8 +127,9 @@ class FM_TS(nn.Module):
             target_t = target*t + z0*(1-t)  ## get the noisy target
             zt = z1*t + z0*(1-t)  ##
             # import ipdb; ipdb.set_trace()
-            zt[partial_mask] = target_t[partial_mask]  ## replace with the noisy version of given ground truth information
-            v = self.output(zt, torch.tensor([t*self.time_scalar]).to(self.device), None) 
+            mask_1d = partial_mask.any(-1) if partial_mask is not None else None  # [B,T] or None
+            v = self.output(zt, torch.tensor([t*self.time_scalar]).to(self.device), mask_1d)
+
 
             z1 = zt.clone() + (1 - t) * v  ## one step euler
             z1 = torch.clamp(z1, min=-1, max=1) ## make sure the upper and lower bound dont exceed
