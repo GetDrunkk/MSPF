@@ -15,19 +15,17 @@ CFG_C1 := Config/etth_C1.yaml
 NAME_B0 := etth_b0_gap1k
 NAME_C1 := etth_c1_gap1k
 
-# results_folder 会自动拼接 _8000
 CKPT_DIR_B0 := ./Checkpoints_$(NAME_B0)_8000
 CKPT_DIR_C1 := ./Checkpoints_$(NAME_C1)_8000
 
 # 保存周期 1800 ⇒ 第一次 checkpoint-1.pt，第二次 checkpoint-2.pt…
-CKPT_TAG := 10        # 评估第几号 checkpoint；按需改
+CKPT_TAG := 13        # 评估第几号 checkpoint；按需改
 .PHONY: setup clean activate run train evaluate \
         train-gap1k  infer-gap1k  full-gap1k
 
 
 # ---------- 原有目标保持不变 ----------
 setup:
-	rm -rf $(ENV_DIR)
 	@command -v pyenv >/dev/null 2>&1 || { echo '❌ pyenv not found. Please install pyenv.'; exit 1; }
 	@if ! pyenv versions --bare | grep -qx "$(PYTHON_VERSION)"; then \
 		echo "⬇️ Installing Python $(PYTHON_VERSION)..."; \
@@ -67,9 +65,6 @@ sample:
 	@$(ENV_DIR)/bin/python sample_and_plot.py
 
 
-# ---------- ★ 新增目标：1 000 步连续缺口实验 ----------
-
-
 # ==================== 目标 ====================
 .PHONY: train-b0 train-c1 infer-b0 infer-c1 \
         full-b0 full-c1 full-all
@@ -77,39 +72,42 @@ sample:
 # ------- Baseline-B0 -------
 train-b0:
 	@echo "🏋️  Train B0 ..."
-	@export results_folder=$(CKPT_DIR_B0) && \
-	PYTHONPATH=. $(PYTHON) main.py \
+	@CUDA_VISIBLE_DEVICES=0 PYTHONPATH=. results_folder=$(CKPT_DIR_B0) \
+	$(PYTHON) main.py \
 	    --train \
 	    --config_file $(CFG_B0) \
-	    --name $(NAME_B0)
+	    --name $(NAME_B0) \
+	    --gpu 0           # 可选：显式绑定“可见索引0”（=物理#3）
+
 
 infer-b0:
 	@echo "🔍  Inference B0 ..."
-	@export results_folder=$(CKPT_DIR_B0) && \
-	PYTHONPATH=. $(PYTHON) scripts/eval_infill.py \
+	@hucfg_num_steps=400 hucfg_Kscale=0.03 results_folder=$(CKPT_DIR_B0) PYTHONPATH=. \
+	$(PYTHON) eval_infill.py \
 	    --config $(CFG_B0) \
 	    --ckpt $(CKPT_TAG) \
-	    --name  $(NAME_B0) \
+	    --name  $(CKPT_DIR_B0) \
 	    --plot_num 3
 
 full-b0: train-b0 infer-b0
 
 # ------- Baseline-C1 -------
 train-c1:
-	@echo "🏋️  Train C1 ..."
-	@export results_folder=$(CKPT_DIR_C1) && \
-	PYTHONPATH=. $(PYTHON) main.py \
+	@echo "🏋️  Train C1 on GPU1 ..."
+	@CUDA_VISIBLE_DEVICES=0,1 \
+	 export results_folder=$(CKPT_DIR_C1) && \
+	 PYTHONPATH=. $(PYTHON) main.py \
 	    --train \
 	    --config_file $(CFG_C1) \
 	    --name $(NAME_C1)
 
 infer-c1:
 	@echo "🔍  Inference C1 ..."
-	@export results_folder=$(CKPT_DIR_C1) && \
-	PYTHONPATH=. $(PYTHON) scripts/eval_infill.py \
+	@hucfg_num_steps=400 hucfg_Kscale=0.05 results_folder=$(CKPT_DIR_C1) PYTHONPATH=. \
+	$(PYTHON) eval_infill.py \
 	    --config $(CFG_C1) \
 	    --ckpt  $(CKPT_TAG) \
-	    --name  $(NAME_C1) \
+	    --name  $(CKPT_DIR_C1) \
 	    --plot_num 3
 
 full-c1: train-c1 infer-c1

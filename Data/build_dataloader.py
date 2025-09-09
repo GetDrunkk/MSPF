@@ -1,13 +1,15 @@
 import torch
 from Utils.io_utils import instantiate_from_config
-
+import os
 
 
 def _collate(batch):
-    if isinstance(batch[0], tuple):          # 插值路径
-        seqs, masks = zip(*batch)
-        return torch.stack(seqs), torch.stack(masks)
-    return torch.stack(batch)                # 旧路径
+    if isinstance(batch[0], tuple):
+        # 自动适配任意元素数的tuple（建议！）
+        cols = list(zip(*batch))
+        return tuple(torch.stack(col) for col in cols)
+    return torch.stack(batch)
+
 
 
 def build_dataloader(config, args=None):
@@ -19,7 +21,7 @@ def build_dataloader(config, args=None):
     dataloader = torch.utils.data.DataLoader(dataset,
                                              batch_size=batch_size,
                                              shuffle=jud,
-                                             num_workers=8,
+                                             num_workers=4,
                                              pin_memory=True,
                                              sampler=None,
                                              drop_last=jud,
@@ -42,9 +44,9 @@ def build_dataloader_cond(config, args=None):
     test_dataset = instantiate_from_config(config['dataloader']['test_dataset'])
 
     dataloader = torch.utils.data.DataLoader(test_dataset,
-                                             batch_size=batch_size,
+                                             batch_size=1,
                                              shuffle=False,
-                                             num_workers=8,
+                                             num_workers=4,
                                              pin_memory=True,
                                              sampler=None,
                                              drop_last=False,

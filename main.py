@@ -93,8 +93,12 @@ def main():
 
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = instantiate_from_config(config['model']).to(device)
-
+    model  = instantiate_from_config(config['model']).to(device)
+    '''
+    if torch.cuda.device_count() > 1:           # 检测到多卡
+        print(f'🚀  Using {torch.cuda.device_count()} GPUs (DataParallel)')
+        model = torch.nn.DataParallel(model)    # <- 只需这一行
+    '''
     
     if args.sample == 1 and args.mode in ['infill', 'predict']:
         test_dataloader_info = build_dataloader_cond(config, args)

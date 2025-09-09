@@ -153,8 +153,7 @@ class FullAttention(nn.Module):
                  n_head, # the number of heads
                  attn_pdrop=0.1, # attention dropout prob
                  resid_pdrop=0.1, # residual attention dropout prob
-                 max_len = None
-                 
+                 max_len=None
     ):
         super().__init__()
         assert n_embd % n_head == 0
@@ -172,55 +171,53 @@ class FullAttention(nn.Module):
         self.q_norm = RMSNorm(n_embd)
         self.k_norm = RMSNorm(n_embd)
 
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.freqs_cis = precompute_freqs_cis(
             n_embd // n_head,
-            max_len * 4,  ## if we use register, the overall length can be longer.
-            50000,  ## 
+            max_len * 4 if max_len is not None else 2048 * 4,
+            50000,
         )
 
-     
         self.regi_num = 128
         self.register = nn.Parameter(torch.randn([1, self.regi_num, n_embd]))
 
-
     def forward(self, x, mask=None):
-        # x = torch.cat([self.register.repeat(x.shape[0],1,1), x], 1)
-
         B, T, C = x.size()
         k = self.key(x)
         q = self.query(x)
         v = self.value(x)
 
+        k = self.k_norm(k) + 0.1 * k
+        q = self.q_norm(q) + 0.1 * q
 
-        k = self.k_norm(k) + 0.1*k
-        q = self.q_norm(q) + 0.1*q
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
 
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        # ---- Rotary Positional Embedding (ROPE) 可选 ----
+        if int(os.environ.get('hucfg_attention_rope_use', '-1')) == 1:
+            freqs_cis = self.freqs_cis.to(self.device)[0: T]
+            q, k = apply_rotary_emb(q.permute(0, 2, 1, 3), k.permute(0, 2, 1, 3), freqs_cis=freqs_cis)
+            q, k = q.permute(0, 2, 1, 3), k.permute(0, 2, 1, 3)
+
+        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))  # (B, nh, T, T)
+
+        # ============ Mask Attention 实现 ============
+        # 原先整块 for 循环和 masked_fill 全删
+        if mask is not None:
+            # mask: [B, T] True=可见
+            key_mask = mask[:, None, None, :]  # [B, 1, 1, T]
+            att = att.masked_fill(~key_mask, float('-inf'))
 
 
-        if int(os.environ.get('hucfg_attention_rope_use', '-1')) == 1: 
-            freqs_cis = self.freqs_cis.to(self.device)[0 : T]
-            q, k = apply_rotary_emb(q.permute(0,2,1,3), k.permute(0,2,1,3), freqs_cis=freqs_cis)
-            q, k = q.permute(0,2,1,3), k.permute(0,2,1,3)
-
-
-
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1))) # (B, nh, T, T)
-
-        att = F.softmax(att, dim=-1) # (B, nh, T, T)
-        # att = torch.sigmoid(att)
+        att = F.softmax(att, dim=-1)  # (B, nh, T, T)
         att = self.attn_drop(att)
-        y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side, (B, T, C)
-        att = att.mean(dim=1, keepdim=False) # (B, T, T)
-
-        # output projection
+        y = att @ v  # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        y = y.transpose(1, 2).contiguous().view(B, T, C)  # (B, T, C)
+        att = att.mean(dim=1, keepdim=False)  # (B, T, T)
         y = self.resid_drop(self.proj(y))
-        # y = y[:,self.regi_num:,:]
-
         return y, att
+
 
 
 class CrossAttention(nn.Module):
