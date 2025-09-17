@@ -82,6 +82,7 @@ trainer = Trainer(cfg,
 trainer.load(args.ckpt, verbose=True)
 # After loading, the model for inference is trainer.ema.ema_model or trainer.model
 inference_model = trainer.ema.ema_model if trainer.ema is not None else trainer.model
+#inference_model = trainer.model
 inference_model.eval() # Ensure model is in eval mode
 
 
@@ -124,6 +125,8 @@ def heun_infill(inference_model,
     time_scalar = float(getattr(inference_model, "time_scalar", 1000.0))
 
     for s in range(num_steps):
+        if not torch.isfinite(current_zt_btd).all():
+            raise RuntimeError(f"NaN detected in ODE state `current_zt_btd` at step {s} BEFORE model call.")
         t_curr = s / num_steps
         t_next = (s + 1) / num_steps
         t_eff_c = t_curr ** k_scale
@@ -230,7 +233,10 @@ def evaluate_random_missing_ratios(inference_model, trainer, dataset_instance, t
                 # --------- 构造 target_x1_bdt ----------
                 if is_c1_model and D_total > D_data:
                     left_ctx, right_ctx = trainer.make_ctx_feature(x_gt, mask_rand, window=10)
+                    
                     mask_chan = mask_rand.any(dim=-1, keepdim=True).float()
+                    #left_ctx  = torch.zeros_like(mask_chan, dtype=x_gt.dtype, device=x_gt.device)
+                    #right_ctx = torch.zeros_like(mask_chan, dtype=x_gt.dtype, device=x_gt.device)
                     data_part = x_gt * mask_rand.float()
                     target_btd = torch.cat([data_part, mask_chan, left_ctx, right_ctx], dim=-1)
                 else:
@@ -351,7 +357,10 @@ with torch.inference_mode():
         if is_c1:
             # 左右上下文直接用原序列 + mask 计算（make_ctx_feature 内部会用 mask 做加权）
             left_ctx_cond, right_ctx_cond = trainer.make_ctx_feature(x_normed_gt, t_m_batch, window=10)
+            
             mask_channel_cond = t_m_batch.any(dim=-1, keepdim=True).float()
+            #left_ctx_cond  = torch.zeros_like(mask_channel_cond, dtype=x_normed_gt.dtype, device=x_normed_gt.device)
+            #right_ctx_cond = torch.zeros_like(mask_channel_cond, dtype=x_normed_gt.dtype, device=x_normed_gt.device)
             data_part = x_normed_gt * t_m_batch.float()  # 观测处放 GT，缺失处为 0
             target_btd_c1 = torch.cat([data_part, mask_channel_cond, left_ctx_cond, right_ctx_cond], dim=-1)
             target_bdt_for_infill = target_btd_c1.permute(0, 2, 1)

@@ -137,6 +137,8 @@ class FM_TS(nn.Module):
         self.log_sigma_smooth = nn.Parameter(torch.tensor(-2.3))  # ≈0.10
         self.log_sigma_curv   = nn.Parameter(torch.tensor(-3.9))  # ≈0.02
 
+        self.log_sigma_bcl    = nn.Parameter(torch.tensor(-2.8))  # ≈0.06
+
 
     def output(self, x, t, mask: Optional[torch.Tensor] = None, padding_masks=None):
         """
@@ -259,6 +261,14 @@ class FM_TS(nn.Module):
             mask_exp     = mask[:, :, :D].permute(0, 2, 1) # [B,D,T] 供主损失
 
         # 4) 前向，拿速度场
+        '''
+        print_once = (torch.randint(0, 100, ()).item() == 0)  # 只偶尔打，避免刷屏
+        if print_once:
+            print(f"[CHK] t_raw min/max={t.min().item():.3e}/{t.max().item():.3e}, time_scalar={self.time_scalar}")
+            print(f"[CHK] z_t stats: min={z_t.min().item():.3e} max={z_t.max().item():.3e} std={z_t.std().item():.3e}")
+        if not torch.isfinite(z_t).all():
+            raise RuntimeError("NaN/Inf in z_t BEFORE Transformer")
+        '''
         model_out = self.output(z_t, t.squeeze() * self.time_scalar, attn_mask_bt)  # [B,T,D_all]
         model_out_feat = model_out.permute(0, 2, 1)[:, :D, :]       # [B,D,T]
         target_feat    = target[:, :, :D].permute(0, 2, 1)          # [B,D,T]
@@ -286,6 +296,26 @@ class FM_TS(nn.Module):
         spec_loss = (Vf[:, :, cut:].abs() ** 2).mean()
 
         total_loss = main_loss + 0.05 * smooth_loss + 0.01 * curv_loss + 1e-4 * spec_loss
+
+        '''
+        # ==================  新增：BCL（不确定性权重）  ==================
+        # 思路：在“缺口边界”时刻（观测↔缺失的交界处），约束 v_theta(z_t, t) ≈ (z1 - z0)。
+        # 具体实现：在 [B,D,T] 上找边界位置，把这些位置上的 (model_out_feat - target_feat)^2 取均值。
+        bcl = torch.zeros((), device=model_out_feat.device)
+        if mask_exp is not None:
+            # 边界：t 与 t-1 的可见性不同处（XOR）
+            edges = mask_exp[:, :, 1:] ^ mask_exp[:, :, :-1]            # [B, D, T-1] (bool)
+            if edges.any():
+                bcl_idx = torch.zeros_like(mask_exp, dtype=torch.bool)  # [B, D, T]
+                bcl_idx[:, :, 1:] |= edges
+                bcl_idx[:, :, :-1] |= edges
+                bcl = ((model_out_feat - target_feat) ** 2)[bcl_idx].mean()
+
+        # 不确定性加权：exp(-2 logσ) * L + logσ
+        w_bcl = torch.exp(-2.0 * self.log_sigma_bcl)
+        total_loss = total_loss + w_bcl * bcl + self.log_sigma_bcl
+        '''
+
         return total_loss.view([])
 
 

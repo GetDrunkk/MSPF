@@ -80,12 +80,16 @@ def main():
     config = merge_opts_to_config(config, args.opts)
 
     ### change the configs and args    
-    import os
-    config = replace_value_in_dict(config, 24, int(args.long_len))  ## to change the default 24 length of time to 64,128,256
+    #import os
+    #config = replace_value_in_dict(config, 24, int(args.long_len))  ## to change the default 24 length of time to 64,128,256
 
 
     args.save_dir = Path(os.environ.get('results_folder'))
     config['solver']['ema']['decay'] = 0.995  ## hucfg912
+
+    N = os.cpu_count() or 1
+
+    torch.set_num_threads(N)                 # intra-op：单算子内部并行
 
 
     logger = Logger(args)

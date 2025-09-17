@@ -9,29 +9,135 @@ from Models.interpretable_diffusion.model_utils import LearnablePositionalEncodi
                                                        AdaLayerNorm, Transpose, RMSNorm, GELU2, series_decomp
 import os
 
+
+
+class SafeGELU(nn.Module):
+    def __init__(self, x_clip: float = 6.0, y_clip: float = 6.0):
+        super().__init__()
+        self.x_clip = float(x_clip)
+        self.y_clip = float(y_clip)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # 入口夹紧，避免极端输入造成 erf/tanh 溢出
+        x = x.clamp(min=-self.x_clip, max=self.x_clip)
+        y = F.gelu(x, approximate='tanh')  # 更平滑的近似
+        # 出口再夹紧，给下游一个硬上限
+        y = y.clamp(min=-self.y_clip, max=self.y_clip)
+        return y
+    
+
+def _chk(name, t):
+    if not torch.isfinite(t).all():
+        t_min = torch.nan_to_num(t, nan=0.0, posinf=0.0, neginf=0.0).min().item()
+        t_max = torch.nan_to_num(t, nan=0.0, posinf=0.0, neginf=0.0).max().item()
+        raise RuntimeError(f"[NaN@{name}] non-finite detected; approx min={t_min:.3e} max={t_max:.3e} shape={tuple(t.shape)}")
+
+def _chk_finite(name: str, t: torch.Tensor):
+    if not torch.isfinite(t).all():
+        bad = (~torch.isfinite(t)).sum().item()
+        t_ = torch.nan_to_num(t, nan=0.0, posinf=0.0, neginf=0.0)
+        t_min, t_max = t_.min().item(), t_.max().item()
+        raise RuntimeError(f"[NaN@{name}] non-finite ({bad} vals); approx min={t_min:.3e} max={t_max:.3e} shape={tuple(t.shape)}")
+
+
+def _masked_softmax_stable(logits, key_mask_bt):  # logits: [B, h, Tq, Tk], key_mask_bt: [B, Tk] (bool)
+    # broadcast 到 [B,1,1,Tk]
+    km = key_mask_bt[:, None, None, :].to(logits.dtype)
+
+    # 先把被遮位置设成大负数，未遮位置减去行内最大值，避免 exp 溢出
+    logits = logits.masked_fill(km == 0, float('-inf'))
+    max_per_row = logits.amax(dim=-1, keepdim=True)
+    # 全遮一行时 max 为 -inf，替换成 0，避免 -inf - (-inf)
+    max_per_row = torch.where(torch.isfinite(max_per_row), max_per_row, torch.zeros_like(max_per_row))
+    logits = logits - max_per_row
+
+    # 只对未遮位置做 exp
+    exp_logits = torch.exp(logits) * km
+    denom = exp_logits.sum(dim=-1, keepdim=True)
+
+    # 分母为 0（整行全遮）→ 该行返回全 0，不做除法
+    att = torch.where(denom > 0, exp_logits / denom, torch.zeros_like(exp_logits))
+    return att
+
 class TrendBlock(nn.Module):
     """
-    Model trend of time series using the polynomial regressor.
+    输入:  [B, in_dim=n_channel, in_feat=n_embd]
+    输出:  [B, out_dim=n_channel, out_feat=n_feat]
     """
     def __init__(self, in_dim, out_dim, in_feat, out_feat, act):
-        super(TrendBlock, self).__init__()
+        super().__init__()
         trend_poly = 3
-        self.trend = nn.Sequential(
-            nn.Conv1d(in_channels=in_dim, out_channels=trend_poly, kernel_size=3, padding=1),
-            act,
-            Transpose(shape=(1, 2)),
-            nn.Conv1d(in_feat, out_feat, 3, stride=1, padding=1)
+
+        # ① 预归一化（按通道），无仿射，稳定输入尺度
+        self.pre_norm = nn.GroupNorm(
+            num_groups=min(32, in_dim),
+            num_channels=in_dim,
+            eps=1e-5,
+            affine=False
         )
 
-        lin_space = torch.arange(1, out_dim + 1, 1) / (out_dim + 1)
-        self.poly_space = torch.stack([lin_space ** float(p + 1) for p in range(trend_poly)], dim=0)
+        # ② 第一层卷积（无 bias）+ 权重范数约束
+        conv1 = nn.Conv1d(in_channels=in_dim, out_channels=trend_poly,
+                          kernel_size=3, padding=1, bias=False)
+        self.conv1 = conv1
+        try:
+            # 加 weight_norm（想完全干净可注释掉）
+            self.conv1 = parametrize.register_parametrization(self.conv1, "weight",
+                                                              nn.utils.parametrizations.weight_norm(self.conv1).parametrizations[0])
+        except Exception:
+            # 不支持就忽略
+            pass
 
-    def forward(self, input):
-        b, c, h = input.shape
-        x = self.trend(input).transpose(1, 2)
-        trend_vals = torch.matmul(x.transpose(1, 2), self.poly_space.to(x.device))
-        trend_vals = trend_vals.transpose(1, 2)
-        return trend_vals
+        # ③ 安全 GELU（替代原激活）
+        self.act = SafeGELU(x_clip=6.0, y_clip=6.0)
+
+        # ④ 保持你的转置 + 第二层 1D 卷积
+        self.transpose = Transpose(shape=(1, 2))           # -> [B, in_feat, 3]
+        self.conv2 = nn.Conv1d(in_feat, out_feat, 3, stride=1, padding=1, bias=True)
+
+        # 多项式基（buffer）
+        lin_space = torch.arange(1, out_dim + 1, 1, dtype=torch.float32) / (out_dim + 1)
+        poly = torch.stack([lin_space ** float(p + 1) for p in range(trend_poly)], dim=0)  # [3, out_dim]
+        self.register_buffer("poly_space", poly)
+
+        # ⑤ 保守初始化
+        with torch.no_grad():
+            # conv1: 小权重
+            if hasattr(self.conv1, "weight"):
+                self.conv1.weight.mul_(0.05)
+            # conv2: 小权重 + 零 bias
+            self.conv2.weight.mul_(0.1)
+            if self.conv2.bias is not None:
+                self.conv2.bias.zero_()
+
+        # ⑥ （可选）对 conv1 的梯度做夹紧 —— 最后一层保险
+        self._enable_grad_fuse = True
+        if self._enable_grad_fuse:
+            for p in self.parameters():
+                if p.requires_grad:
+                    p.register_hook(lambda g: torch.clamp(g, -1e3, 1e3))  # 需要更紧就把 1e3 改小
+
+        # 输出缩放（第一层后面的一个小门，进一步限幅）
+        self.post_scale = 0.1
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        # input: [B, C=n_channel, H=n_embd]
+        dtype_in = input.dtype
+        with torch.cuda.amp.autocast(False):  # ★ 全程 FP32
+            x = input.float()                         # [B,C,H]
+            x = self.pre_norm(x)                      # 预归一化
+            x = self.conv1(x)                         # [B,3,H]
+            x = self.post_scale * x                   # 小尺度输出
+            x = self.act(x)                           # 安全 GELU
+            x = self.transpose(x)                     # [B,H,3]
+            x = self.conv2(x)                         # [B,out_feat,3]
+            ps = self.poly_space.to(device=x.device, dtype=x.dtype)  # [3,out_dim]
+            trend_vals = torch.matmul(x, ps).transpose(1, 2)  # [B,out_dim,out_feat]
+
+            # 出口再做一次轻微夹紧，防止回传链条过激
+            trend_vals = trend_vals.clamp(min=-50., max=50.)
+        return trend_vals.to(dtype_in)
+
     
 
 class MovingBlock(nn.Module):
@@ -181,18 +287,23 @@ class FullAttention(nn.Module):
         self.regi_num = 128
         self.register = nn.Parameter(torch.randn([1, self.regi_num, n_embd]))
 
+
+
     def forward(self, x, mask=None):
+        
+        
         B, T, C = x.size()
         k = self.key(x)
         q = self.query(x)
         v = self.value(x)
-
-        k = self.k_norm(k) + 0.1 * k
-        q = self.q_norm(q) + 0.1 * q
+        k = self.k_norm(k) 
+        q = self.q_norm(q)
+        _chk("att.q", q); _chk("att.k", k); _chk("att.v", v)
 
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        _chk("att.q.hsplit", q); _chk("att.k.hsplit", k); _chk("att.v.hsplit", v)
 
         # ---- Rotary Positional Embedding (ROPE) 可选 ----
         if int(os.environ.get('hucfg_attention_rope_use', '-1')) == 1:
@@ -201,16 +312,24 @@ class FullAttention(nn.Module):
             q, k = q.permute(0, 2, 1, 3), k.permute(0, 2, 1, 3)
 
         att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))  # (B, nh, T, T)
+        _chk("att.logits", att)
 
         # ============ Mask Attention 实现 ============
-        # 原先整块 for 循环和 masked_fill 全删
+
         if mask is not None:
-            # mask: [B, T] True=可见
-            key_mask = mask[:, None, None, :]  # [B, 1, 1, T]
-            att = att.masked_fill(~key_mask, float('-inf'))
+            # 接受 [B,T] 或 [B,T,D]
+            if mask.dim() == 3:
+                key_mask_bt = mask.any(dim=-1)               # [B,T]
+            else:
+                key_mask_bt = mask                           # [B,T]
+            att = _masked_softmax_stable(att, key_mask_bt)   # ★ 不会 NaN
+        else:
+            # 纯 softmax 也减个最大值，数值更稳
+            att = F.softmax(att - att.amax(dim=-1, keepdim=True), dim=-1)
 
+        #assert torch.isfinite(att).all(), "NaN/Inf after masked softmax"
 
-        att = F.softmax(att, dim=-1)  # (B, nh, T, T)
+        #att = F.softmax(att, dim=-1)  # (B, nh, T, T)
         att = self.attn_drop(att)
         y = att @ v  # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
         y = y.transpose(1, 2).contiguous().view(B, T, C)  # (B, T, C)
@@ -276,8 +395,8 @@ class CrossAttention(nn.Module):
 
 
 
-        k = self.k_norm(k) + 0.1*k  ## residual qk norm
-        q = self.q_norm(q) + 0.1*q
+        k = self.k_norm(k) 
+        q = self.q_norm(q) 
 
         k = k.view(B, T_E, self.n_head, C // self.n_head).transpose(1, 2)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
@@ -291,8 +410,20 @@ class CrossAttention(nn.Module):
         v = self.value(encoder_output).view(B, T_E, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1))) # (B, nh, T, T)
 
-        att = F.softmax(att, dim=-1) # (B, nh, T, T)
+        # ============ Mask Attention 实现 ============
+
+        if mask is not None:
+            # 接受 [B,T] 或 [B,T,D]
+            if mask.dim() == 3:
+                key_mask_bt = mask.any(dim=-1)               # [B,T]
+            else:
+                key_mask_bt = mask                           # [B,T]
+            att = _masked_softmax_stable(att, key_mask_bt)   # ★ 不会 NaN
+        else:
+            # 纯 softmax 也减个最大值，数值更稳
+            att = F.softmax(att - att.amax(dim=-1, keepdim=True), dim=-1)
         # att = torch.sigmoid(att)  ## sigmoid attention infact 
+            
 
         att = self.attn_drop(att)
         y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
@@ -341,8 +472,8 @@ class EncoderBlock(nn.Module):
         
     def forward(self, x, timestep, mask=None, label_emb=None):
         a, att = self.attn(self.ln1(x, timestep, label_emb), mask=mask)
-        x = x + a
-        x = x + self.mlp(self.ln2(x))   # only one really use encoder_output
+        x = x + 0.70710678*a
+        x = x + 0.70710678*self.mlp(self.ln2(x))   # only one really use encoder_output
         return x, att
 
 
@@ -397,6 +528,7 @@ class DecoderBlock(nn.Module):
         self.ln1 = AdaLayerNorm(n_embd)
         self.ln2 = nn.LayerNorm(n_embd)
         # self.ln2 = AdaLayerNorm(n_embd)
+        self.trend_gate = nn.Parameter(torch.tensor(0.0))
 
         self.attn1 = FullAttention(
                 n_embd=n_embd,
@@ -419,7 +551,9 @@ class DecoderBlock(nn.Module):
 
         assert activate in ['GELU', 'GELU2']
         act = nn.GELU() if activate == 'GELU' else GELU2()
-
+        self.n_feat    = n_feat
+        self.n_channel = n_channel
+        self.d_model   = n_embd
         self.trend = TrendBlock(n_channel, n_channel, n_embd, n_feat, act=act)
         self.seasonal = FourierLayer(d_model=n_embd)
 
@@ -435,18 +569,34 @@ class DecoderBlock(nn.Module):
         self.linear = nn.Linear(n_embd, n_feat)
 
     def forward(self, x, encoder_output, timestep, mask=None, label_emb=None):
-        a, att = self.attn1(self.ln1(x, timestep, label_emb), mask=mask)
-        x = x + a
+        res_scale = 2**-0.5   # ≈0.707
 
-        a, att = self.attn2(self.ln1_1(x, timestep), encoder_output, mask=mask)
-        x = x + a
+        a, _ = self.attn1(self.ln1(x, timestep, label_emb), mask=mask)
+        x = x + res_scale * a
+
+        a, _ = self.attn2(self.ln1_1(x, timestep), encoder_output, mask=mask)
+        x = x + res_scale * a
+
+        # proj 仍保持你的缩放（0.1）与 /√d
+        #x1, x2 = (0.1 * self.proj(x)).chunk(2, dim=1)
         x1, x2 = self.proj(x).chunk(2, dim=1)
-        trend, season = self.trend(x1), self.seasonal(x2)
-        x = x + self.mlp(self.ln2(x))
+        #scale = (self.d_model ** 0.5)
+        #x1 = x1 / scale
+        #x2 = x2 / scale
 
+        trend  = self.trend(x1).clamp_(-50., 50.)
+        g = torch.sigmoid(self.trend_gate)
+        trend = g * trend
+        season = self.seasonal(x2)
+
+        #x = x + res_scale * self.mlp(self.ln2(x))   # ★ MLP 残差也衰减
+        #season = 0.0 * x[:, :, :self.d_model]  # 形状对齐即可
+        #B, C, _ = x.shape
+        #trend = x.new_zeros(B, C, self.n_feat)   # [B, C, n_feat]
 
         m = torch.mean(x, dim=1, keepdim=True)
         return x - m, self.linear(m), trend, season
+
     
 
 class Decoder(nn.Module):
@@ -537,21 +687,19 @@ class Transformer(nn.Module):
                                block_activate, condition_dim=n_embd, max_len = self.max_len)
 
     def forward(self, input, t, padding_masks=None, return_res=False):
-        emb = self.emb(input)
+        _chk_finite("emb_input", input)
+        emb = self.emb(input); _chk("emb", emb)
+        _chk_finite("emb", emb)
+        enc_cond = self.encoder(emb, t, padding_masks=padding_masks); _chk("encoder.out", enc_cond)
+        output, mean, trend, season = self.decoder(emb, t, enc_cond, padding_masks=padding_masks)
+        _chk("decoder.out", output); _chk("decoder.mean", mean); _chk("decoder.trend", trend); _chk("decoder.season", season)
 
-        inp_enc = emb
-        enc_cond = self.encoder(inp_enc, t, padding_masks=padding_masks)
-
-        inp_dec = emb
-        output, mean, trend, season = self.decoder(inp_dec, t, enc_cond, padding_masks=padding_masks)
-
-        res = self.inverse(output)
-        res_m = torch.mean(res, dim=1, keepdim=True)
+        res = self.inverse(output); _chk("inverse(res)", res)
+        res_m = torch.mean(res, dim=1, keepdim=True); _chk("res.mean", res_m)
         season_error = self.combine_s(season.transpose(1, 2)).transpose(1, 2) + res - res_m
-        trend = self.combine_m(mean) + res_m + trend
-        out = trend+season_error
-
-  
+        _chk("season_error", season_error)
+        trend = self.combine_m(mean) + res_m + trend; _chk("trend", trend)
+        out = trend + season_error; _chk("out(final)", out)
 
         return out
 

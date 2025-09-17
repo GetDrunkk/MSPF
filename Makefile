@@ -15,11 +15,11 @@ CFG_C1 := Config/etth_C1.yaml
 NAME_B0 := etth_b0_gap1k
 NAME_C1 := etth_c1_gap1k
 
-CKPT_DIR_B0 := ./Checkpoints_$(NAME_B0)_8000
-CKPT_DIR_C1 := ./Checkpoints_$(NAME_C1)_8000
+CKPT_DIR_B0 := .Checkpoints/Checkpoints_$(NAME_B0)_8000
+CKPT_DIR_C1 := .Checkpoints/Checkpoints_$(NAME_C1)_8000
 
 # 保存周期 1800 ⇒ 第一次 checkpoint-1.pt，第二次 checkpoint-2.pt…
-CKPT_TAG := 13        # 评估第几号 checkpoint；按需改
+CKPT_TAG := 5        # 评估第几号 checkpoint；按需改
 .PHONY: setup clean activate run train evaluate \
         train-gap1k  infer-gap1k  full-gap1k
 

@@ -23,6 +23,95 @@ def cycle(dl):
         for data in dl:
             yield data
 
+def _nan_grad_hook(name):
+    def _hook(module, grad_input, grad_output):
+        def has_bad(g):
+            # g 可能是 None / Tensor / 稀疏 Tensor
+            if g is None:
+                return False
+            if not torch.is_tensor(g):
+                return False
+            t = g
+            if t.is_sparse:
+                t = t.coalesce().values()
+            t = t.detach()
+            # 返回 Python bool
+            return (~torch.isfinite(t)).any().item()
+
+        def max_abs(g):
+            if g is None or (not torch.is_tensor(g)):
+                return 0.0
+            t = g.coalesce().values() if g.is_sparse else g
+            return t.detach().abs().max().item()
+
+        bad_in  = any(has_bad(g) for g in grad_input)
+        bad_out = any(has_bad(g) for g in grad_output)
+
+        if bad_in or bad_out:
+            # 打点一些有用信息
+            mi = max((max_abs(g) for g in grad_input), default=0.0)
+            mo = max((max_abs(g) for g in grad_output), default=0.0)
+            print(f"[NaN-Grad] at {name} (bad_in={bad_in}, bad_out={bad_out}, "
+                  f"max|gin|={mi:.3e}, max|gout|={mo:.3e})")
+            # 可选：再看看该模块参数的范数
+            try:
+                pn = sum((p.detach().abs().max().item() for p in module.parameters(recurse=False)), 0.0)
+                print(f"[NaN-Grad] param max(abs) sum={pn:.3e}")
+            except Exception:
+                pass
+            raise RuntimeError(f"NaN gradient hit at {name}")
+    return _hook
+
+
+def register_nan_debug_hooks(root_model):
+    """
+    root_model: 你的顶层模型（FM_TS 实例或 DataParallel 包裹）
+    只在最可疑的几处挂 backward hook，定位第一处 NaN 梯度来源
+    """
+    # 如果用了 DataParallel，要拿 .module
+    fm = root_model.module if isinstance(root_model, torch.nn.DataParallel) else root_model
+
+    # 你的 FM_TS 里真正的 Transformer 在 fm.model
+    core = getattr(fm, "model", fm)
+    dec  = core.decoder
+
+    handles = []
+
+    # 只钩几个最敏感的位置：trend 的 conv1 + gelu、自注意/交叉注意
+    for i, block in enumerate(dec.blocks):
+        # TrendBlock 的 Sequential: [0]=Conv1d, [1]=GELU, [2]=Transpose, [3]=Conv1d
+        try:
+            handles.append(block.trend.trend[0].register_full_backward_hook(
+                _nan_grad_hook(f"decoder.blocks[{i}].trend.conv1")))
+        except Exception: pass
+        try:
+            handles.append(block.trend.trend[1].register_full_backward_hook(
+                _nan_grad_hook(f"decoder.blocks[{i}].trend.gelu")))
+        except Exception: pass
+
+        # 注意力两条支路
+        try:
+            handles.append(block.attn1.register_full_backward_hook(
+                _nan_grad_hook(f"decoder.blocks[{i}].attn1")))
+        except Exception: pass
+        try:
+            handles.append(block.attn2.register_full_backward_hook(
+                _nan_grad_hook(f"decoder.blocks[{i}].attn2")))
+        except Exception: pass
+
+        # MLP 入口（常见放大点）
+        try:
+            handles.append(block.mlp[0].register_full_backward_hook(
+                _nan_grad_hook(f"decoder.blocks[{i}].mlp.fc1")))
+        except Exception: pass
+
+        # 只钩前 2~3 个 block 往往就够定位；想全钩也可
+        if i >= 2:
+            break
+
+    return handles
+
+
 
 class Trainer(object):
     def __init__(self, config, args, model, dataloader, logger=None):
@@ -53,8 +142,9 @@ class Trainer(object):
         ema_update_every = config['solver']['ema']['update_interval']
 
         # 允许 TF32（Ampere+ 可显著加速，数值对 FM 问题足够稳）
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.set_float32_matmul_precision("high")
+        if torch.cuda.is_available():
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.set_float32_matmul_precision("high")
 
         # AdamW（支持 fused 就开启）
         use_fused = hasattr(AdamW, "fused") and torch.cuda.is_available()
@@ -69,6 +159,7 @@ class Trainer(object):
 
         # AMP
         self.use_amp = torch.cuda.is_available()
+        self.use_amp = False
         self.scaler  = torch.cuda.amp.GradScaler(enabled=self.use_amp)
 
         # “虚拟 epoch” 步数：用 dataloader 长度和梯度累积一起折算
@@ -83,6 +174,15 @@ class Trainer(object):
         if self.logger is not None:
             self.logger.log_info(str(get_model_parameters_info(self.model)))
         self.log_frequency = 100
+
+        # __init__ 里其他东西都配好后……
+        self._nan_hook_handles = []
+        if os.environ.get("DEBUG_NAN", "1") == "1":  # 用环境变量控制开关
+            try:
+                self._nan_hook_handles = register_nan_debug_hooks(self.model)
+                print(f"[DEBUG] NaN hooks registered: {len(self._nan_hook_handles)}")
+            except Exception as e:
+                print(f"[WARN] failed to register NaN hooks: {e}")
 
 
     
@@ -222,6 +322,7 @@ class Trainer(object):
 
 
     def train(self):
+        torch.autograd.set_detect_anomaly(True)
         device = self.device
         step = 0
         if self.logger is not None:
@@ -241,6 +342,10 @@ class Trainer(object):
                             left_ctx, right_ctx = self.make_ctx_feature(input_x, mask, window=10)  # [B,T,1]
                             mask_channel = mask.any(dim=-1, keepdim=True).float()                  # [B,T,1]
                             # 目标：gt + 条件通道（C1）
+
+                            #left_ctx  = torch.zeros_like(mask_channel, dtype=input_x.dtype, device=input_x.device)
+                            #right_ctx = torch.zeros_like(mask_channel, dtype=input_x.dtype, device=input_x.device)
+
                             z1_target = torch.cat([gt, mask_channel, left_ctx, right_ctx], dim=-1).permute(0, 2, 1)  # [B,D+3,T]
                             loss = self.model(z1_target, mask)  # [B,T] True=observed
                         elif len(batch) == 2:
@@ -249,6 +354,10 @@ class Trainer(object):
                             left_ctx, right_ctx = self.make_ctx_feature(x, mask, window=10)        # [B,T,1]
                             mask_channel = mask.any(dim=-1, keepdim=True).float()                  # [B,T,1]
                             # 目标：x + 条件通道（C1）
+
+                            #left_ctx  = torch.zeros_like(mask_channel, dtype=x.dtype, device=x.device)
+                            #right_ctx = torch.zeros_like(mask_channel, dtype=x.dtype, device=x.device)
+
                             z1_target = torch.cat([x, mask_channel, left_ctx, right_ctx], dim=-1).permute(0, 2, 1)  # [B,D+3,T]
                             loss = self.model(z1_target, mask)
                         else:
@@ -268,6 +377,22 @@ class Trainer(object):
                 # —— 梯度累积结束，做一次真正的优化步骤 ——
                 # 1) 反缩放 + 裁剪（可选）
                 self.scaler.unscale_(self.opt)
+                # 统计梯度异常 & 最大梯度来源
+                bad, max_g, max_name = False, 0.0, ""
+                for n, p in self.model.named_parameters():
+                    if p.grad is None: 
+                        continue
+                    if not torch.isfinite(p.grad).all():
+                        print(f"[GRAD NaN] {n} grad has non-finite values")
+                        bad = True
+                        break
+                    g = p.grad.data.detach().abs().max().item()
+                    if g > max_g:
+                        max_g, max_name = g, n
+                if bad:
+                    raise RuntimeError("Non-finite gradient detected — see above")
+
+                #print(f"[GRAD] max |grad|={max_g:.3e} @ {max_name}")  # 每个 step 或每N步打印一次
                 clip_grad_norm_(self.model.parameters(), 1.0)
 
                 # 2) 优化器 step + AMP scaler 更新
@@ -382,6 +507,9 @@ class Trainer(object):
             if is_c1:
                 left_ctx, right_ctx = self.make_ctx_feature(x_normed, t_m, window=10)
                 mask_chan = t_m.any(dim=-1, keepdim=True).float()
+                # 关掉 left/right：用全零占位
+                #left_ctx  = torch.zeros_like(mask_chan, dtype=x_normed.dtype, device=x_normed.device)
+                #right_ctx = torch.zeros_like(mask_chan, dtype=x_normed.dtype, device=x_normed.device)
                 target_btd = torch.cat([x_normed, mask_chan, left_ctx, right_ctx], dim=-1)  # [B,T,D+3]
                                         # [B,T,D+3]
             else:

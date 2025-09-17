@@ -10,7 +10,9 @@ def _collate(batch):
         return tuple(torch.stack(col) for col in cols)
     return torch.stack(batch)
 
-
+use_cuda = torch.cuda.is_available()
+num_workers = 4 if use_cuda else 0
+pin_memory  = True if use_cuda else False
 
 def build_dataloader(config, args=None):
     batch_size = config['dataloader']['batch_size']
@@ -21,8 +23,8 @@ def build_dataloader(config, args=None):
     dataloader = torch.utils.data.DataLoader(dataset,
                                              batch_size=batch_size,
                                              shuffle=jud,
-                                             num_workers=4,
-                                             pin_memory=True,
+                                             num_workers=num_workers,
+                                             pin_memory=pin_memory,
                                              sampler=None,
                                              drop_last=jud,
                                              collate_fn=_collate)
@@ -46,8 +48,8 @@ def build_dataloader_cond(config, args=None):
     dataloader = torch.utils.data.DataLoader(test_dataset,
                                              batch_size=1,
                                              shuffle=False,
-                                             num_workers=4,
-                                             pin_memory=True,
+                                             num_workers=num_workers,
+                                             pin_memory=pin_memory,
                                              sampler=None,
                                              drop_last=False,
                                              collate_fn=_collate)
